@@ -16,6 +16,10 @@ set -euo pipefail
 # Configuration:
 # - Optional config file: ${REPO_ROOT}/config/wifi_watchdog.conf
 # - All variables below can be overridden there.
+#
+# Permissions:
+# - nmcli connection/radio control is often gated by polkit.
+# - This script detects missing permissions and logs a clear error instead of silently failing.
 
 # shellcheck disable=SC1091
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib.sh"
@@ -25,12 +29,12 @@ watch_log="${LOG_DIR}/wifi_watchdog.log"
 # Defaults (override in config/wifi_watchdog.conf)
 IFACE="wlan0"
 GW="192.168.4.1"
-EXPECTED_SSID=""                 # e.g. "esp32-softap-ssid"
+EXPECTED_SSID=""                     # e.g. "esp32-softap-ssid"
 EXPECTED_SUBNET_PREFIX="192.168.4."  # e.g. "192.168.4."
 PING_COUNT=1
 PING_TIMEOUT=1
 RECONNECT_TRIES=2
-NM_CONN=""                       # recommended: NetworkManager connection profile name
+NM_CONN=""                           # recommended: NetworkManager connection profile name
 
 CFG="${REPO_ROOT}/config/wifi_watchdog.conf"
 if [[ -f "${CFG}" ]]; then
@@ -63,17 +67,9 @@ nm_ssid_best_effort() {
   fi
 }
 
-nm_ip4() {
-  nmcli -g IP4.ADDRESS dev show "${IFACE}" 2>/dev/null | head -n1 || true
-}
-
-nm_gw4() {
-  nmcli -g IP4.GATEWAY dev show "${IFACE}" 2>/dev/null || true
-}
-
-nm_state() {
-  nmcli -g GENERAL.STATE dev show "${IFACE}" 2>/dev/null || true
-}
+nm_ip4() { nmcli -g IP4.ADDRESS dev show "${IFACE}" 2>/dev/null | head -n1 || true; }
+nm_gw4() { nmcli -g IP4.GATEWAY dev show "${IFACE}" 2>/dev/null || true; }
+nm_state() { nmcli -g GENERAL.STATE dev show "${IFACE}" 2>/dev/null || true; }
 
 log_state() {
   local ssid ip gw state
@@ -113,8 +109,40 @@ nm_reset_link() {
   ip route flush cache >/dev/null 2>&1 || true
 }
 
+# ---- Permission detection (polkit-gated nmcli operations) ----
+
+nm_perm_value() {
+  # Returns the VALUE column (e.g. "yes", "no", "auth") for a permission id, or empty.
+  # Only "yes" is suitable for unattended operation.
+  local perm_id="$1"
+  nmcli -t -f PERMISSION,VALUE general permissions 2>/dev/null \
+    | awk -F: -v id="$perm_id" '$1==id{print $2; exit}'
+}
+
+nm_require_perm_or_die() {
+  # Fail early with a clear error if a required NM permission is not granted.
+  local perm_id="$1"
+  local v=""
+  v="$(nm_perm_value "$perm_id")"
+
+  # If we cannot read permissions, do not fail here; runtime checks will still catch auth errors.
+  if [[ -z "$v" ]]; then
+    echo "[$(log_ts)] [WARN] Unable to read NetworkManager permissions; proceeding with runtime checks"
+    return 0
+  fi
+
+  if [[ "$v" != "yes" ]]; then
+    echo "[$(log_ts)] [ERROR] Insufficient NetworkManager permission: ${perm_id} (value='${v}')"
+    echo "[$(log_ts)] [ERROR] Fix: grant this action via polkit."
+    echo "[$(log_ts)] [ERROR] Hint: nmcli general permissions"
+    exit 2
+  fi
+}
+
 nm_bounce_connection() {
   local c="${NM_CONN}"
+  local out="" rc=0
+
   if [[ -z "${c}" ]]; then
     c="$(nm_active_wifi_name)"
   fi
@@ -123,15 +151,54 @@ nm_bounce_connection() {
     return 1
   fi
 
-  nmcli -w 5 con down "${c}" >/dev/null 2>&1 || true
-  nmcli -w 10 con up "${c}"  >/dev/null 2>&1 || true
+  out="$(nmcli -w 5 con down "${c}" 2>&1)"; rc=$?
+  if (( rc != 0 )); then
+    if grep -qi 'not authorized' <<<"$out"; then
+      echo "[$(log_ts)] [ERROR] Not authorized to deactivate connections (polkit)."
+      echo "[$(log_ts)] [ERROR] Output: ${out}"
+      return 77
+    fi
+    echo "[$(log_ts)] [WARN] nmcli con down failed (rc=${rc}): ${out}"
+  fi
+
+  out="$(nmcli -w 10 con up "${c}" 2>&1)"; rc=$?
+  if (( rc != 0 )); then
+    if grep -qi 'not authorized' <<<"$out"; then
+      echo "[$(log_ts)] [ERROR] Not authorized to activate connections (polkit)."
+      echo "[$(log_ts)] [ERROR] Output: ${out}"
+      return 77
+    fi
+    echo "[$(log_ts)] [WARN] nmcli con up failed (rc=${rc}): ${out}"
+  fi
+
   return 0
 }
 
 nm_toggle_radio() {
-  nmcli -w 5 radio wifi off >/dev/null 2>&1 || true
+  local out="" rc=0
+
+  out="$(nmcli -w 5 radio wifi off 2>&1)"; rc=$?
+  if (( rc != 0 )); then
+    if grep -qi 'not authorized' <<<"$out"; then
+      echo "[$(log_ts)] [ERROR] Not authorized to toggle Wi-Fi radio (polkit)."
+      echo "[$(log_ts)] [ERROR] Output: ${out}"
+      return 77
+    fi
+    echo "[$(log_ts)] [WARN] nmcli radio wifi off failed (rc=${rc}): ${out}"
+  fi
+
   sleep 0.5
-  nmcli -w 10 radio wifi on  >/dev/null 2>&1 || true
+
+  out="$(nmcli -w 10 radio wifi on 2>&1)"; rc=$?
+  if (( rc != 0 )); then
+    if grep -qi 'not authorized' <<<"$out"; then
+      echo "[$(log_ts)] [ERROR] Not authorized to toggle Wi-Fi radio (polkit)."
+      echo "[$(log_ts)] [ERROR] Output: ${out}"
+      return 77
+    fi
+    echo "[$(log_ts)] [WARN] nmcli radio wifi on failed (rc=${rc}): ${out}"
+  fi
+
   return 0
 }
 
@@ -142,6 +209,12 @@ nm_toggle_radio() {
     echo "[$(log_ts)] [ERROR] nmcli not available; cannot perform NetworkManager recovery"
     exit 1
   fi
+
+  # Fail early if NM reports that required permissions are not granted.
+  # - Connection bounce: org.freedesktop.NetworkManager.network-control
+  # - Radio toggle:      org.freedesktop.NetworkManager.enable-disable-wifi
+  nm_require_perm_or_die "org.freedesktop.NetworkManager.network-control"
+  nm_require_perm_or_die "org.freedesktop.NetworkManager.enable-disable-wifi"
 
   log_state
 
@@ -161,7 +234,13 @@ nm_toggle_radio() {
     fi
 
     echo "[$(log_ts)] [INFO] Recovery B: bounce NetworkManager connection (try ${i}/${RECONNECT_TRIES})"
-    nm_bounce_connection || true
+    if ! nm_bounce_connection; then
+      rc=$?
+      if [[ $rc -eq 77 ]]; then
+        echo "[$(log_ts)] [ERROR] Recovery aborted due to insufficient permissions (network-control)."
+        exit 2
+      fi
+    fi
     sleep 0.6
     if health_ok; then
       echo "[$(log_ts)] [INFO] Link OK after connection bounce"
@@ -169,7 +248,13 @@ nm_toggle_radio() {
     fi
 
     echo "[$(log_ts)] [INFO] Recovery C: toggle Wi-Fi radio (try ${i}/${RECONNECT_TRIES})"
-    nm_toggle_radio || true
+    if ! nm_toggle_radio; then
+      rc=$?
+      if [[ $rc -eq 77 ]]; then
+        echo "[$(log_ts)] [ERROR] Recovery aborted due to insufficient permissions (enable-disable-wifi)."
+        exit 2
+      fi
+    fi
     sleep 0.8
     if health_ok; then
       echo "[$(log_ts)] [INFO] Link OK after radio toggle"
