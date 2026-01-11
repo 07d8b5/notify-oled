@@ -1,0 +1,4 @@
+# Optional repository root override.
+# If unset, the pipeline scripts infer the root based on their location.
+
+# REPO_ROOT="/opt/notify-oled"

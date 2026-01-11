@@ -1,0 +1,16 @@
+# Optional configuration for pipeline/10_wifi_watchdog.sh
+
+IFACE="wlan0"
+
+# If set, the watchdog only runs when currently associated to this SSID.
+# EXPECTED_SSID="notify-oled"
+
+# ESP32 SoftAP gateway / receiver IP
+GW="192.168.4.1"
+
+# Ping parameters
+PING_COUNT=1
+PING_TIMEOUT=1
+
+# How many reconnect attempts to make
+RECONNECT_TRIES=2

@@ -1,0 +1,10 @@
+# UDP destination for the ESP32 receiver.
+#
+# For most ESP32 SoftAP setups, 192.168.4.1 is the default AP-side IP.
+
+ESP32_HOST="192.168.4.1"
+UDP_PORT=7777
+
+# Send behavior
+TIMEOUT=2     # seconds
+RETRIES=3

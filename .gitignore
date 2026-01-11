@@ -1,0 +1,31 @@
+# Build/editor
+*.swp
+*.swo
+*.tmp
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Windows "Mark of the Web" ADS artifacts that sometimes leak into archives
+*:Zone.Identifier
+
+# Runtime outputs (generated)
+out/
+logs/
+!/out/.gitkeep
+!/logs/.gitkeep
+
+# Local overrides / secrets (do not commit)
+.env
+.env.*
+
+# Host-specific configs: commit only *.example templates
+config/*.conf
+!config/*.conf.example
+config/*.local
+config/*.local.*
+config/local.*
+
+# ESP32 local override header (keeps Wi-Fi creds out of git)
+esp32/**/config_local.h
