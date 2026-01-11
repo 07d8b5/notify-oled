@@ -1,16 +1,27 @@
-# Home Telemetry -> ESP32-C3 OLED ("notify-oled")
+# Home Telemetry → ESP32-C3 OLED ("notify-oled")
 
-Collect small status signals from a machine, select what matters, and send a
-two-line UDP payload to an ESP32-C3 which displays it on a small SSD1306 OLED.
+Collect small status signals from a Linux host, select what matters, then send two short
+lines over UDP to an ESP32-C3 that displays them on an SSD1306 OLED.
 
-Design goals:
-- collectors are single-purpose executables that print **one JSON object**
-- the pipeline produces a single, clamped two-line display payload
-- the ESP32 firmware is intentionally simple (display what it is sent)
+This repo is intentionally boring:
+- collectors print one line of JSON
+- pipeline turns that into a 2-line display payload
+- sender ships `name\nvalue` to the ESP32
+
 
 ## What it does now
 
-### On the Pi (collector host)
+### On the Linux host (collection + selection + send)
+
+Recommended entrypoint:
+
+0) `pipeline/run_pipeline.sh` (recommended)
+   - runs the full pipeline in order:
+     - `00_run_all.sh` → `10_wifi_watchdog.sh` → `20_select.sh` → `30_send.sh` → `40_housekeeping.sh`
+   - appends a per-stage run log to: `logs/pipeline.log`
+   - exits non-zero if any stage fails (so cron/systemd can detect failure)
+
+Individual stages (typically run directly only for debugging):
 
 1) `pipeline/00_run_all.sh`
    - runs every executable in `collectors/`
@@ -24,34 +35,30 @@ Design goals:
 2) `pipeline/10_wifi_watchdog.sh` (required; link reliability)
    - required because the ESP32 SoftAP link is not reliably stable in practice
    - prevents the send stage from failing due to a wedged or half-associated Wi-Fi client state
-
-   Behavior:
-   - checks reachability of the ESP32 SoftAP gateway/target (typically `192.168.4.1`)
-   - if unreachable, attempts recovery using user-space Wi-Fi control (no reboot):
-     - disconnect + reassociate using `wpa_cli`
-     - re-request an address if necessary (DHCP renew may be host-dependent)
-   - does not modify telemetry outputs (`out/raw.ndjson`, `out/display.json`) and does not restart unrelated services
-   - writes diagnostics to `logs/wifi_watchdog.log`
-
-   Exit status:
-   - `0` if the link is healthy **or** recovery succeeded
-   - non-zero if recovery failed (the send stage is expected to fail in this case)
+   - logs: `logs/wifi_watchdog.log`
 
 3) `pipeline/20_select.sh`
    - reads NDJSON from: `out/raw.ndjson`
    - keeps **ONLY** items where `enabled == true`
-   - writes JSON array to: `out/display.json`
+   - writes a JSON array to: `out/display.json`
    - logs: `logs/select.log`
 
 4) `pipeline/30_send.sh`
    - reads: `out/display.json` (array OR single object)
    - chooses:
-     - first enabled item if present
-     - else first item
+     - the first `enabled==true` item if present
+     - otherwise the first item
    - sends via UDP to the ESP32:
      - line 1: `name`  (clamped to 6 chars)
      - line 2: `value` (clamped to 6 chars)
    - logs: `logs/send.log`
+
+5) `pipeline/40_housekeeping.sh` (log + temp management)
+   - rotates and optionally compresses log files when they exceed a configured size
+   - prunes old rotated logs (optional)
+   - removes stale temp files in `out/` (e.g., `*.tmp`)
+   - rate-limited by default (runs at most once per 24 hours even if scheduled every minute)
+   - logs: `logs/housekeeping.log`
 
 
 ### On the ESP32-C3 (receiver / display)
@@ -80,6 +87,7 @@ At runtime it:
 
 ## Repo layout
 
+```text
 repo/
 ├── README.md
 ├── collectors/                   # executable scripts; each prints 1 JSON line
@@ -88,36 +96,57 @@ repo/
 ├── collectors_disabled/          # parking lot for collectors you don't want run
 ├── pipeline/
 │   ├── 00_run_all.sh             # run collectors -> out/raw.ndjson (NDJSON)
-│   ├── 10_wifi_watchdog.sh       # keep Pi connected to ESP32 SoftAP (required)
+│   ├── 10_wifi_watchdog.sh       # keep host connected to ESP32 SoftAP (required)
 │   ├── 20_select.sh              # filter/shape -> out/display.json (JSON array)
 │   ├── 30_send.sh                # UDP send name/value to ESP32
+│   ├── 40_housekeeping.sh        # rotate/prune logs; clean temp files
+│   ├── run_pipeline.sh           # recommended entrypoint: runs all stages + per-stage logging
 │   └── _lib.sh                   # shared helpers for pipeline scripts (not executable)
 ├── config/
-│   ├── repo.conf.example          # template for REPO_ROOT override
-│   ├── esp32.conf.example         # template for ESP32_HOST, UDP_PORT, TIMEOUT, RETRIES
-│   └── wifi_watchdog.conf.example # template for watchdog settings
+│   ├── repo.conf.example         # defines REPO_ROOT (template)
+│   ├── esp32.conf.example        # ESP32_HOST, UDP_PORT, TIMEOUT, RETRIES (template)
+│   ├── wifi_watchdog.conf.example # Wi-Fi watchdog settings (template)
+│   └── housekeeping.conf.example # housekeeping settings (template)
 ├── esp32/                        # ESP32 firmware project (Arduino / PlatformIO)
 ├── out/                          # generated (gitignored)
 │   ├── raw.ndjson                # NDJSON: one object per collector
 │   └── display.json              # JSON array: selected items for display
 └── logs/                         # runtime logs (gitignored)
+    ├── pipeline.log
     ├── run_all.log
     ├── select.log
     ├── send.log
     ├── wifi_watchdog.log
+    ├── housekeeping.log
     └── collectors/
         └── <collector>.log
+```
+
+
+## JSON contract (collectors)
+
+Each collector prints EXACTLY ONE LINE of JSON to stdout.
+
+Required keys:
+- `name`    (string)                     stable identifier
+- `value`   (string|number|bool|null)    value to show/use
+- `enabled` (boolean)                    whether it should be considered
+
+Example:
+
+```json
+{"name":"ZFS","value":"ONLINE","enabled":true}
+```
 
 
 ## Config
 
-### Pi side
+Templates are provided in `config/*.conf.example`. Copy them to the corresponding `*.conf` files to override defaults.
 
-The `config/*.example` files are templates. Copy them to the non-`.example`
-names to enable local overrides. These local config files are ignored by git.
+### Linux host side
 
-`config/repo.conf` (optional)
-- `REPO_ROOT="/path/to/repo"`   # override autodetected repo root
+`config/repo.conf`
+- `REPO_ROOT="/path/to/repo"`   # set to your clone location
 
 `config/esp32.conf` (UDP mode)
 - `ESP32_HOST="192.168.4.1"`
@@ -125,23 +154,57 @@ names to enable local overrides. These local config files are ignored by git.
 - `TIMEOUT=2`
 - `RETRIES=3`
 
-`config/wifi_watchdog.conf`
+`config/wifi_watchdog.conf` (required; Wi‑Fi link watchdog)
+- see `config/wifi_watchdog.conf.example` for defaults
 - `IFACE="wlan0"`
 - `GW="192.168.4.1"`
-- `EXPECTED_SSID=""` (optional)
+- `PING_COUNT=1`
+- `PING_TIMEOUT=1`
+- `RECONNECT_TRIES=2`
+- `EXPECTED_SSID` (optional)
+
+`config/housekeeping.conf` (optional; log rotation and pruning)
+- see `config/housekeeping.conf.example` for defaults
+- `RUN_INTERVAL_HOURS=24`
+- `MAX_LOG_BYTES=2097152`
+- `ROTATE_KEEP=30`
+- `COMPRESS=true`
+- `PRUNE_DAYS=180`
+- `OUT_TMP_PRUNE_DAYS=2`
 
 ### ESP32 side
 
 Edit `esp32/esp32_oled_udp/config.h`:
-
 - SoftAP identity:
   - `AP_SSID` (default: `"notify-oled"`)
   - `AP_PASS` (default: `"change-me"`)
   - `AP_HIDDEN` (1 = hidden, 0 = broadcast)
   - `AP_MAXCONN`
 
-- Local override header (recommended for real Wi‑Fi credentials):
-  - create `esp32/esp32_oled_udp/config_local.h` (ignored by git)
-  - define `NOTIFY_AP_SSID` and `NOTIFY_AP_PASS` there
-  - optional: `NOTIFY_SCAN_LOG_SSIDS=1` to print nearby SSIDs during the boot scan
+
+## Scheduling (crontab)
+
+Run the single entrypoint script. This keeps the schedule line readable and produces a single per-stage log (`logs/pipeline.log`).
+
+Edit your crontab:
+
+```bash
+crontab -e
+```
+
+Run every minute (quiet):
+
+```cron
+* * * * * /absolute/path/to/repo/pipeline/run_pipeline.sh >/dev/null 2>&1
+```
+
+If you want cron to keep a separate log (in addition to `logs/pipeline.log`):
+
+```cron
+* * * * * /absolute/path/to/repo/pipeline/run_pipeline.sh >>/absolute/path/to/repo/logs/cron.log 2>&1
+```
+
+Notes:
+- Use absolute paths in cron (cron runs with a minimal environment).
+- Ensure scripts are executable: `chmod +x pipeline/*.sh`.
 

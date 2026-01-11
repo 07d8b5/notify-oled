@@ -1,0 +1,29 @@
+# Housekeeping (log rotation + pruning)
+#
+# Copy to: config/housekeeping.conf
+# The pipeline will source config/housekeeping.conf if present.
+#
+# All values are optional. Integers are in seconds/bytes/days as noted.
+
+# Run housekeeping at most once per N hours (the cron can run every minute).
+RUN_INTERVAL_HOURS=24
+
+# Rotate a log file when it exceeds this many bytes.
+# Example: 2 MiB = 2097152
+MAX_LOG_BYTES=2097152
+
+# Keep this many rotated copies per log file (e.g., .1, .2.gz, ...).
+ROTATE_KEEP=30
+
+# Compress rotated logs with gzip.
+COMPRESS=true
+
+# Start compressing from this rotation index (keep .1 uncompressed for easy tailing).
+COMPRESS_FROM=2
+
+# Optionally prune very old rotated logs by mtime (days). Set 0 to disable.
+PRUNE_DAYS=180
+
+# Delete temporary files in out/ older than this many days (e.g., *.tmp).
+OUT_TMP_PRUNE_DAYS=2
+
