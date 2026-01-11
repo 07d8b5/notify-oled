@@ -2,6 +2,17 @@
 set -euo pipefail
 
 # Run all collectors and write NDJSON to out/raw.ndjson.
+#
+# Collectors:
+# - Executable files in ${REPO_ROOT}/collectors/
+# - Must emit exactly one non-empty JSON line on stdout with the contract:
+#     {"name": "<string>", "value": <any>, "enabled": <boolean>}
+#
+# Behavior:
+# - Each collector is run with a timeout when available.
+# - Collector stderr is appended to ${LOG_DIR}/collectors/<collector>.log
+# - If a collector fails/invalid output/timeout, a synthetic item is written:
+#     {"name":"<collector_basename>","value":"ERR|BAD","enabled":true}
 
 # shellcheck disable=SC1091
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib.sh"
@@ -31,9 +42,9 @@ run_log="${LOG_DIR}/run_all.log"
     base="$(basename "$c")"
     stderr_log="${LOG_DIR}/collectors/${base}.log"
 
-    # Run collector. Prefer a timeout if available.
     out=""
     status=0
+
     set +e
     if command -v timeout >/dev/null 2>&1; then
       out="$(timeout 10s "$c" 2>>"${stderr_log}")"
@@ -46,7 +57,7 @@ run_log="${LOG_DIR}/run_all.log"
 
     if [[ $status -eq 124 ]]; then
       echo "[$(log_ts)] [WARN] Timeout: ${base} (last stderr lines follow)"
-      tail -n 20 "${stderr_log}" | sed 's/^/  | /'
+      tail -n 20 "${stderr_log}" 2>/dev/null | sed 's/^/  | /'
     fi
 
     # Require exactly one non-empty line.
@@ -82,3 +93,4 @@ run_log="${LOG_DIR}/run_all.log"
 } >>"${run_log}"
 
 mv -f "${raw_tmp}" "${raw_out}"
+
