@@ -44,6 +44,11 @@ run_log="${LOG_DIR}/run_all.log"
     fi
     set -e
 
+    if [[ $status -eq 124 ]]; then
+      echo "[$(log_ts)] [WARN] Timeout: ${base} (last stderr lines follow)"
+      tail -n 20 "${stderr_log}" | sed 's/^/  | /'
+    fi
+
     # Require exactly one non-empty line.
     mapfile -t _lines < <(printf '%s' "$out" | tr -d '\r' | awk 'NF')
 
